@@ -1,0 +1,33 @@
+[package]
+name = "rsomics-rna-fragment-size"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/omics-rust/rsomics-rna-fragment-size"
+authors = ["Zane Leong <efd@live.com>"]
+description = "Per-transcript mRNA fragment-size distribution for paired RNA-seq — Rust port of RSeQC RNA_fragment_size.py"
+categories = ["science", "command-line-utilities"]
+keywords = ["rnaseq", "rseqc", "bam", "qc", "bioinformatics"]
+
+[[bin]]
+name = "rsomics-rna-fragment-size"
+path = "src/main.rs"
+
+[lib]
+name = "rsomics_rna_fragment_size"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+rsomics-common = { version = "0.6" }
+rsomics-bamio = { version = "0.1" }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "bench"
+harness = false

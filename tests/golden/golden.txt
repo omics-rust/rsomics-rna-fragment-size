@@ -1,4 +1,4 @@
 chrom	tx_start	tx_end	symbol	frag_count	frag_mean	frag_median	frag_std
 chr1	1000	4000	geneX	3	934.3333333333334	851.0	432.69183285823897
-chr1	10000	12200	geneZ	2	522.0	522.0	70.0
+chr1	10000	12200	geneZ	2	0	0	0
 chr1	20000	21000	geneEmpty	0	0	0	0

@@ -1,20 +1,35 @@
 //! Per-transcript mRNA fragment-size distribution for paired-end RNA-seq,
-//! matching RSeQC `RNA_fragment_size.py`. For each BED12 transcript it pairs
-//! uniquely-mapped mates whose alignments both fall inside the transcript's
-//! exons and measures the fragment length in transcript (mRNA) coordinates —
-//! the genomic span with introns removed — then reports count, mean, median and
-//! population standard deviation.
+//! matching RSeQC `RNA_fragment_size.py`. For each BED12 transcript it scans the
+//! `read1` alignments starting inside the transcript span whose mate also starts
+//! inside it, and reports fragment count, mean, median and population standard
+//! deviation.
 //!
 //! ## Origin
 //!
 //! Independent Rust reimplementation of RSeQC `RNA_fragment_size.py`
 //! (LGPL-2.1+), based on the tool's documented behaviour, the SAM/BAM and BED12
-//! format specs, and black-box testing against the upstream binary. The exact
-//! rules — fragment size = `mRNA(rightmost end) - mRNA(leftmost start)` plus one
-//! per exon junction the fragment crosses, both mates required uniquely mapped
-//! (mapq ≥ `-q`, no proper-pair flag required), both mates inside the transcript
-//! exons, population stdev, and transcripts below `-n` printed as `count 0 0 0`
-//! — were established by black-box probing. No upstream source was read.
+//! format specs, and black-box testing against the upstream binary. No upstream
+//! source was read; every rule below was fixed by observing RSeQC's output on
+//! crafted alignments.
+//!
+//! Each fragment is measured from the `read1` mate only (flag `0x40`), using the
+//! read's start, the mate start (`PNEXT`), and read1's query-aligned length:
+//!
+//! ```text
+//! size = |mrna(mate_start) - mrna(read_start)| + junctions_crossed + qlen(read1)
+//! ```
+//!
+//! where `mrna(g)` is the count of exonic bases before genomic position `g` (a
+//! position in an intron collapses to the start of the following exon),
+//! `junctions_crossed` is the difference of the two positions' exon indices, and
+//! `qlen(read1)` sums the query-consuming CIGAR ops `M/I/=/X` (soft-clips and
+//! deletions excluded, insertions included). RSeQC's `+junctions_crossed` term
+//! reproduces a one-base-per-junction offset visible in its output. A read1 is
+//! used for a transcript when it is uniquely mapped (mapq ≥ `-q`), its mate is
+//! mapped (no proper-pair flag required), `tx_start ≤ read_start < tx_end`, and
+//! `tx_start ≤ mate_start ≤ tx_end`; the mate's own alignment may extend past the
+//! exons or the transcript end. Transcripts below `-n` fragments print
+//! `count 0 0 0`; the reported stdev is population (÷n).
 //!
 //! License: MIT OR Apache-2.0.
 //! Upstream credit: RSeQC <https://rseqc.sourceforge.net/> (LGPL-2.1+).
@@ -27,9 +42,12 @@ use std::path::Path;
 use rsomics_bamio::raw::{self, RawRecord};
 use rsomics_common::{Result, RsomicsError};
 
-// Reads that never contribute a fragment.
+// Reads that never contribute a fragment: unmapped, secondary, qcfail,
+// duplicate, supplementary.
 const SKIP: u16 = 0x0004 | 0x0100 | 0x0200 | 0x0400 | 0x0800;
 const PAIRED: u16 = 0x0001;
+const MATE_UNMAPPED: u16 = 0x0008;
+const READ1: u16 = 0x0040;
 
 struct Transcript {
     chrom: String,
@@ -41,29 +59,23 @@ struct Transcript {
 }
 
 impl Transcript {
-    /// mRNA offset of a genomic coordinate and the index of the exon it falls in,
-    /// or `None` if it lies in an intron. Accepts an exclusive end coordinate
-    /// sitting on an exon's right edge.
-    fn mrna(&self, g: i64) -> Option<(i64, usize)> {
+    /// mRNA offset (count of exonic bases before genomic position `g`) paired
+    /// with the exon index used to count junctions. A position inside an intron
+    /// collapses to the start of the following exon; a position past the last
+    /// exon collapses to the transcript's full length.
+    fn locate(&self, g: i64) -> (i64, usize) {
         for (i, &(s, e)) in self.exons.iter().enumerate() {
-            if g >= s && g <= e {
-                return Some((self.cum[i] + (g - s), i));
+            if g < s {
+                return (self.cum[i], i);
+            }
+            if g < e {
+                return (self.cum[i] + (g - s), i);
             }
         }
-        None
+        let last = self.exons.len() - 1;
+        let (s, e) = self.exons[last];
+        (self.cum[last] + (e - s), last)
     }
-
-    /// True when the mate `[s, e)` lies entirely within a single exon.
-    fn holds(&self, s: i64, e: i64) -> bool {
-        self.exons.iter().any(|&(es, ee)| es <= s && e <= ee)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Mate {
-    start: i64,
-    end: i64,
-    tid: i32,
 }
 
 /// Per chromosome: `(transcripts sorted as (tx_start, index), widest transcript)`.
@@ -107,52 +119,50 @@ pub fn fragment_sizes(
         .map(|k| String::from_utf8_lossy(k.as_ref()).to_uppercase())
         .collect();
 
-    let mut pending: HashMap<Vec<u8>, Mate> = HashMap::new();
     let mut rec = RawRecord::default();
     loop {
         if raw::read_record(reader.get_mut(), &mut rec)? == 0 {
             break;
         }
         let flags = rec.flags();
-        if flags & SKIP != 0 || flags & PAIRED == 0 || rec.mapping_quality() < mapq {
+        if flags & SKIP != 0
+            || flags & PAIRED == 0
+            || flags & READ1 == 0
+            || flags & MATE_UNMAPPED != 0
+            || rec.mapping_quality() < mapq
+        {
             continue;
         }
         let tid = rec.reference_sequence_id();
         if tid < 0 {
             continue;
         }
-        let start = i64::from(rec.alignment_start());
-        let end = start + ref_span(rec.cigar_ops());
-        let name = rec.name().to_vec();
-        match pending.remove(&name) {
-            None => {
-                pending.insert(name, Mate { start, end, tid });
-            }
-            Some(mate) => {
-                if mate.tid == tid {
-                    record_fragment(
-                        &transcripts,
-                        &by_chrom,
-                        &ref_names,
-                        tid,
-                        (start, end),
-                        (mate.start, mate.end),
-                        &mut sizes,
-                    );
-                }
-            }
-        }
+        let read_start = i64::from(rec.alignment_start());
+        let mate_start = i64::from(rec.mate_alignment_start());
+        let qlen = query_len(rec.cigar_ops());
+        record_fragment(
+            &transcripts,
+            &by_chrom,
+            &ref_names,
+            tid,
+            read_start,
+            mate_start,
+            qlen,
+            &mut sizes,
+        );
     }
     Ok(FragmentSizes { transcripts, sizes })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_fragment(
     transcripts: &[Transcript],
     by_chrom: &ChromIndex,
     ref_names: &[String],
     tid: i32,
-    m1: (i64, i64),
-    m2: (i64, i64),
+    read_start: i64,
+    mate_start: i64,
+    qlen: i64,
     sizes: &mut [Vec<i64>],
 ) {
     let Some(chrom) = ref_names.get(tid as usize) else {
@@ -161,33 +171,32 @@ fn record_fragment(
     let Some((entries, max_span)) = by_chrom.get(chrom) else {
         return;
     };
-    let left_start = m1.0.min(m2.0);
-    let right_end = m1.1.max(m2.1);
-    let hi = entries.partition_point(|&(s, _)| s <= left_start);
+    let hi = entries.partition_point(|&(s, _)| s <= read_start);
     for &(tx_start, idx) in entries[..hi].iter().rev() {
-        if tx_start < left_start - *max_span {
+        if tx_start < read_start - *max_span {
             break;
         }
         let t = &transcripts[idx];
-        if t.tx_end < right_end || !t.holds(m1.0, m1.1) || !t.holds(m2.0, m2.1) {
+        if read_start >= t.tx_end || mate_start < t.tx_start || mate_start > t.tx_end {
             continue;
         }
-        // mRNA span plus one per exon junction the fragment crosses (RSeQC).
-        if let (Some((a_off, a_ex)), Some((b_off, b_ex))) = (t.mrna(left_start), t.mrna(right_end))
-        {
-            sizes[idx].push((b_off - a_off) + (b_ex - a_ex) as i64);
-        }
+        let (a_off, a_ex) = t.locate(read_start);
+        let (b_off, b_ex) = t.locate(mate_start);
+        let junctions = a_ex.abs_diff(b_ex) as i64;
+        sizes[idx].push((a_off - b_off).abs() + junctions + qlen);
     }
 }
 
-fn ref_span<I: Iterator<Item = (u8, u32)>>(ops: I) -> i64 {
-    let mut span = 0;
-    for (op, len) in ops {
-        if matches!(op, 0 | 2 | 3 | 7 | 8) {
-            span += i64::from(len);
+/// Query-aligned length: query-consuming CIGAR ops that are not soft-clips
+/// (`M`, `I`, `=`, `X`). Matches pysam `query_alignment_length`.
+fn query_len<I: Iterator<Item = (u8, u32)>>(ops: I) -> i64 {
+    let mut len = 0;
+    for (op, n) in ops {
+        if matches!(op, 0 | 1 | 7 | 8) {
+            len += i64::from(n);
         }
     }
-    span
+    len
 }
 
 impl FragmentSizes {

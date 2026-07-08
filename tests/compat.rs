@@ -7,16 +7,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-#[test]
-fn matches_rseqc_rna_fragment_size() {
+fn run(bam: &str, bed: &str, golden: &str) {
     let g = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
     let bin = env!("CARGO_BIN_EXE_rsomics-rna-fragment-size");
     let out = Command::new(bin)
         .args([
             "-i",
-            g.join("reads.bam").to_str().unwrap(),
+            g.join(bam).to_str().unwrap(),
             "-r",
-            g.join("genes.bed").to_str().unwrap(),
+            g.join(bed).to_str().unwrap(),
             "-n",
             "1",
         ])
@@ -24,9 +23,22 @@ fn matches_rseqc_rna_fragment_size() {
         .unwrap();
     assert!(out.status.success());
     let ours = String::from_utf8(out.stdout).unwrap();
-    let golden = std::fs::read_to_string(g.join("golden.txt")).unwrap();
-    assert_eq!(
-        ours, golden,
-        "fragment-size report differs from RSeQC golden"
-    );
+    let want = std::fs::read_to_string(g.join(golden)).unwrap();
+    assert_eq!(ours, want, "fragment-size report differs from RSeQC golden");
+}
+
+#[test]
+fn matches_rseqc_rna_fragment_size() {
+    run("reads.bam", "genes.bed", "golden.txt");
+}
+
+/// Crafted pairs exercise each way the size rule differs from a naive
+/// fragment-span measurement, with expected values taken from RSeQC 5.0.4:
+/// a mate whose alignment runs past `tx_end` (kept on `mate_start <= tx_end`),
+/// an N-CIGAR read spanning an exon junction and a read pair buried in an
+/// intron (both counted), soft-clips excluded and insertions included in
+/// read1's query length, and a read1 lying downstream of its mate.
+#[test]
+fn matches_rseqc_crafted_edge_cases() {
+    run("crafted.bam", "crafted.bed", "crafted.txt");
 }
